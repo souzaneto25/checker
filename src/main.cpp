@@ -1,31 +1,30 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
-// #include <SoftwareSerial.h>
 #include <cmath>
 #include <ArduinoJson.h>
 
-#define RXD2 16                            // RXD2 do ESP32 conectado ao TX do GPS
-#define TXD2 17                            // TXD2 do ESP32 conectado ao RX do GPS
-#define GPS_BAUDRATE 9600                  // Baud rate do GPS
-#define WIFI_SSID "PRUU"                   // SSID da rede WiFi
-#define WIFI_PASSWORD "gustavoejulia"      // Senha da rede WiFi
-#define MQTT_SERVER "broker.emqx.io"       // Endereço do servidor MQTT
-#define MQTT_PORT 1883                     // Porta do servidor MQTT
-#define MQTT_TOPIC "esp32/gps/coordinates" // Tópico MQTT para publicar as coordenadas
-#define MQTT_USERNAME "emqx"               // Usuario do servidor
-#define MQTT_PASSWORD "public"             // Senha do usuario
-#define LED 2                              // Led interno do esp32
-#define LED_EXT 15                         // Led externo ao esp32
+#define RXD2 16                          // RXD2 do ESP32 conectado ao TX do GPS
+#define TXD2 17                          // TXD2 do ESP32 conectado ao RX do GPS
+#define GPS_BAUDRATE 9600                // Baud rate do GPS
+#define WIFI_SSID "redewifi"             // SSID da rede WiFi
+#define WIFI_PASSWORD "senhawifi"        // Senha da rede WiFi
+#define MQTT_SERVER "broker.emqx.io"     // Endereço do servidor MQTT
+#define MQTT_PORT 1883                   // Porta do servidor MQTT
+#define MQTT_TOPIC_PREFIX "data/checker" // Préfixo do tópico MQTT para publicar as coordenadas
+#define MQTT_USERNAME "emqx"             // Usuario do servidor
+#define MQTT_PASSWORD "public"           // Senha do usuario
+#define LED 2                            // Led interno do esp32
+#define LED_EXT 15                       // Led externo ao esp32
 
-const double LATITUDE_REFERENCE = -22.129688;  // Latitude de referência para calcular o distanciamento do dispositivo
-const double LONGITUDE_REFERENCE = -51.408570; // Longitude de referência para calcular o distanciamento do dispositivo
-const double MAX_DISTANCE = 1000;              // Distância limite usada para disparar SMS de alerta de distanciamento, medida em metros
+const double LATITUDE_REFERENCE = -5.77179;                        // Latitude de referência para calcular o distanciamento do dispositivo
+const double LONGITUDE_REFERENCE = -37.56939;                      // Longitude de referência para calcular o distanciamento do dispositivo
+const double MAX_DISTANCE = 100;                                   // Distância limite usada para disparar SMS de alerta de distanciamento, medida em metros
+const String TOPIC_DRONE = "data/tracker/esp32-00:00:00:00:00:00"; // Tópico que retorna a localização atual do drone
 
-// SoftwareSerial ss(RXD2, TXD2);        // Define a serial para comunicação com o GPS
-WiFiClient wifiClient;                // Cliente WiFi
-PubSubClient client(wifiClient);      // Cliente MQTT
-const int json = JSON_OBJECT_SIZE(6); // Tamanho do objeto
-StaticJsonDocument<json> doc;         // Criação do documento (objeto que vai ser publicado)
+WiFiClient wifiClient;           // Cliente WiFi
+PubSubClient client(wifiClient); // Cliente MQTT
+StaticJsonDocument<192> doc;     // Criação do documento (objeto que vai ajudar a calcular a distancia)
+StaticJsonDocument<256> doc2;    // Criação do documento (objeto que vai ser publicado)
 
 // Função responsável por conectar ao Wifi
 void setup_wifi()
@@ -51,6 +50,31 @@ void setup_wifi()
   Serial.println("IP address: ");
   Serial.println(WiFi.localIP());
   digitalWrite(LED, HIGH);
+}
+
+// Função responsárvel por conectar ao MQTT e realizar o subscribe referente ao tópico do drone
+void connectToMqtt()
+{
+  while (!client.connected())
+  {
+    String client_id = "esp32-";
+    client_id += String(WiFi.macAddress());
+    Serial.println("Conectando ao broker MQTT...");
+    if (client.connect(client_id.c_str(), MQTT_USERNAME, MQTT_PASSWORD))
+    {
+      Serial.println("Conectado ao broker MQTT!");
+      if (client.subscribe(TOPIC_DRONE.c_str()))
+      {
+        Serial.println("Subscribed");
+      }
+    }
+    else
+    {
+      Serial.print("Falha na conexão MQTT: ");
+      Serial.println(client.state());
+      delay(5000);
+    }
+  }
 }
 
 // Calcula a distância em que o dispositivo está, levando em consideração a curvatura da terra (valor retornado em metros) formula de vicenty
@@ -111,10 +135,12 @@ bool deviceIsTooFar(float lat, float lon, String *distance)
   return false;
 }
 
+// será chamada sempre que houver uma mensagem MQTT recebida, conexão perdida ou estabelecida, etc.
 void callback(char *topic, byte *payload, unsigned int length)
 {
-  deserializeJson(doc, payload);
 
+  // dados recebidos do tracker
+  deserializeJson(doc, payload);
   const char *sensor = doc["sensor"];
   const char *device = doc["device"];
   float latitude = doc["coordinates"]["lat"];
@@ -125,44 +151,81 @@ void callback(char *topic, byte *payload, unsigned int length)
   if (deviceIsTooFar(latitude, longitude, &distance))
   {
 
-    Serial.println("Device is too far");
+    if (client.connected())
+    {
+      String client_id = "esp32-";
+      client_id += String(WiFi.macAddress());
+      String topic = String(MQTT_TOPIC_PREFIX) + "/" + client_id;
+      Serial.println("...................Device is far....................");
+      String new_data;
+      doc2.clear();
+      doc2["device"] = "esp32";
+      doc2["sensor"] = client_id;
+      doc2["distance"] = String(distance);
+      doc2["isClose"] = false;
+      doc2["referenceLocation"]["lat"] = String(LATITUDE_REFERENCE, 6);
+      doc2["referenceLocation"]["lon"] = String(LONGITUDE_REFERENCE, 6);
+      doc2["referenceLocation"]["max_distance"] = String(MAX_DISTANCE);
+      serializeJson(doc2, new_data);
+      client.publish(topic.c_str(), new_data.c_str());
+      Serial.println(new_data);
+      Serial.println(topic);
+      Serial.println("...................................................");
+    }
+
     digitalWrite(LED_EXT, LOW); // apaga o led sinalizando que o dispositivo está muito longe
     Serial.println("{Lat: " + String(latitude, 6) + "," + " Long: " + String(longitude, 6) + "," + distance + "m }");
   }
   else
   {
-    Serial.println("Device is too close");
+
+    if (client.connected())
+    {
+      String client_id = "esp32-";
+      client_id += String(WiFi.macAddress());
+      String topic = String(MQTT_TOPIC_PREFIX) + "/" + client_id;
+      Serial.println("...................Device is close....................");
+      String new_data;
+      doc2.clear();
+      doc2["device"] = "esp32";
+      doc2["sensor"] = client_id;
+      doc2["distance"] = String(distance);
+      doc2["isClose"] = true;
+      doc2["referenceLocation"]["lat"] = String(LATITUDE_REFERENCE, 6);
+      doc2["referenceLocation"]["lon"] = String(LONGITUDE_REFERENCE, 6);
+      doc2["referenceLocation"]["max_distance"] = String(MAX_DISTANCE);
+      serializeJson(doc2, new_data);
+      client.publish(topic.c_str(), new_data.c_str());
+      Serial.println(new_data);
+      Serial.println(topic);
+      Serial.println("...................................................");
+    }
+
     digitalWrite(LED_EXT, HIGH); // acende led sinalizando que o dispositivo está muito perto
     Serial.println("{Lat: " + String(latitude, 6) + "," + " Long: " + String(longitude, 6) + "," + distance + "m }");
   }
-  delay(5000);
 }
+
 // Função de inicialização, após conectar ao wifi inicializa o servidor
 void setup()
 {
   Serial.begin(115200);
-  // ss.begin(GPS_BAUDRATE);
   pinMode(LED, OUTPUT);
   pinMode(LED_EXT, OUTPUT);
   setup_wifi();
   client.setServer(MQTT_SERVER, MQTT_PORT);
   client.setCallback(callback);
 
-  if (client.connect("client_esp32"))
-  {
-    // connection succeeded
-    Serial.println("Connected");
-    boolean r = client.subscribe("esp32/gps/coordinates");
-    Serial.println("Subscribed");
-  }
-  else
-  {
-    Serial.println("Connection failed ");
-  }
+  connectToMqtt();
 }
 
 // Função de loop
 void loop()
 {
+  // Mantenha a conexão MQTT ativa
+  if (!client.connected())
+  {
+    connectToMqtt();
+  }
   client.loop();
 }
